@@ -1,28 +1,31 @@
 # Python Virtual Environment
+**/.venv/
 App/.venv/
 .venv/
 venv/
 ENV/
 
 # Python Cache & Bytecode
+**/__pycache__/
 __pycache__/
 *.py[cod]
 *$py.class
 
 # PyInstaller Build Cache
 build/
+dist/
 *.spec
 
 # Daily Operational Working Folders & Confidential Data
-02 OKT 2026/
-05 OKT 2026/
-06 OKT 2026/
-07 OKT 2026/
+* OKT 2026/
+* OKT 2026 - */
 etc/
 App/examples/
 scratch*
 install_mingit.py
+AxaptaAutomation/logs/
 
 # Master Reference
 !REFERENSI/
 !REFERENSI/SALESUNIT2026.xlsx
+!REFERENSI/*.csv

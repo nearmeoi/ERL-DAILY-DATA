@@ -15,7 +15,8 @@ import openpyxl
 from openpyxl.utils import get_column_letter
 from openpyxl.utils.dataframe import dataframe_to_rows
 
-from process_do_summary import process_do_summary_file
+from process_do_summary import process_do_summary_file, find_do_summary_for_date
+from recheck_sp import run_recheck_sp, RecheckSPResult
 
 # ==============================================================================
 # 1. KONFIGURASI GLOBAL & LOKASI DIREKTORI
@@ -37,6 +38,31 @@ class StageStatus(str, Enum):
     SUCCESS = "SUCCESS"
     SKIPPED = "SKIPPED"
     FAILED = "FAILED"
+
+class PipelineMode(str, Enum):
+    ALL = "ALL"                      # Tahap 1 - 10 (Full Pipeline)
+    POSISI_STOK = "POSISI_STOK"      # Tahap 1, 2, 3, 4, 5, 6, 9, 10 (Pagi: STOK -> Format Cabang + Recheck SP)
+    RECHECK_SP = "RECHECK_SP"        # Tahap 1, 9 (Recheck SP Kemarin Saja)
+    BUKU_MASUK = "BUKU_MASUK"        # Tahap 1, 7, 10 (Siang: Buku Masuk & FIFO Saja)
+    DO_SUMMARY = "DO_SUMMARY"        # Tahap 1, 8, 10 (Sore: DO Summary External Saja)
+    CUSTOM = "CUSTOM"                # Sesuai tahapan yang dipilih user
+
+MODE_DESCRIPTIONS = {
+    PipelineMode.ALL: "Semua Tahap (1 - 9) [Full Pipeline]",
+    PipelineMode.POSISI_STOK: "Posisi Stok Cabang + Recheck SP (Tahap 1-6, 9) [Pagi]",
+    PipelineMode.RECHECK_SP: "Recheck SP Kemarin (Validasi Posting Saja)",
+    PipelineMode.BUKU_MASUK: "Buku Masuk & FIFO (Tahap 7 Saja) [Siang]",
+    PipelineMode.DO_SUMMARY: "DO Summary External (Tahap 8 Saja) [Sore]",
+    PipelineMode.CUSTOM: "Kustom (Pilih Tahap Sendiri)"
+}
+
+MODE_DEFAULT_STAGES = {
+    PipelineMode.ALL: [1, 2, 3, 4, 5, 6, 7, 8, 9],
+    PipelineMode.POSISI_STOK: [1, 2, 3, 4, 5, 6, 9],
+    PipelineMode.RECHECK_SP: [1, 9],
+    PipelineMode.BUKU_MASUK: [1, 7],
+    PipelineMode.DO_SUMMARY: [1, 8],
+}
 
 class DailyDataError(Exception):
     """Base class untuk seluruh custom exception aplikasi Daily Data."""
@@ -265,25 +291,37 @@ def resolve_work_dir(name_or_path: Optional[str]) -> str:
                 return d
     raise FileNotFoundError(f"Folder harian '{name_or_path}' tidak ditemukan di {PROJECT_ROOT}")
 
-def write_pivot_sheet(wb: openpyxl.Workbook, header_value: str, pivot_dict: Dict[str, float], sheet_name: str = "Sheet2"):
+def write_pivot_sheet(
+    wb: openpyxl.Workbook,
+    header_value: str,
+    pivot_dict: Dict[str, float],
+    sheet_name: str = "Sheet2",
+    page_header: Optional[tuple] = None
+):
     """
     Menulis hasil pivot tabel standar:
     Diletakkan di tab pertama, baris 3 header, tanpa item kosong, dan Grand Total di akhir.
+    Jika page_header diberikan (misal ('Warehouse', '56')), baris 1 akan memuat filter.
     """
     if sheet_name in wb.sheetnames:
         del wb[sheet_name]
     ws = wb.create_sheet(sheet_name, 0)
+    if page_header:
+        ws.cell(row=1, column=1, value=page_header[0])
+        ws.cell(row=1, column=2, value=page_header[1])
     ws.cell(row=3, column=1, value="Row Labels")
     ws.cell(row=3, column=2, value=header_value)
     r = 4
     total = 0.0
     for item, q in sorted((k, v) for k, v in pivot_dict.items() if k):
         ws.cell(row=r, column=1, value=item)
-        ws.cell(row=r, column=2, value=q)
+        c = ws.cell(row=r, column=2, value=int(round(q)))
+        c.number_format = "General"
         total += q
         r += 1
     ws.cell(row=r, column=1, value="Grand Total")
-    ws.cell(row=r, column=2, value=total)
+    c_tot = ws.cell(row=r, column=2, value=int(round(total)))
+    c_tot.number_format = "General"
     ws.column_dimensions["A"].width = 16
     ws.column_dimensions["B"].width = 24
     return ws
@@ -416,49 +454,76 @@ def build_sales_hierarchy(su_path: str) -> Dict[str, Dict[str, str]]:
 class InputBundle:
     work_dir: str
     date_str: str
-    format_cabang_path: str
+    format_cabang_path: Optional[str]
     stok_path: Optional[str]
     trn_path: Optional[str]
     soout_path: Optional[str]
     poout_path: Optional[str]
     su_path: Optional[str]
     buku_masuk_path: Optional[str]
-    do_summary_path: Optional[str]
+    buku_masuk_paths: List[str] = field(default_factory=list)
+    do_summary_path: Optional[str] = None
 
-def stage_1_discover_inputs(work_dir: str, report_fn: Callable[[str], None]) -> InputBundle:
+def stage_1_discover_inputs(
+    work_dir: str,
+    report_fn: Callable[[str], None],
+    target_stages: Optional[List[int]] = None
+) -> InputBundle:
+    if target_stages is None:
+        target_stages = [1, 2, 3, 4, 5, 6, 7, 8, 9]
+
     report_fn(f"Menelaah file input pada folder: {work_dir}")
     format_cabang_path = find_file("FORMAT POSISISTOK*.xlsx", [work_dir])
-    if not format_cabang_path:
+    if 6 in target_stages and not format_cabang_path:
         raise MandatoryFileNotFoundError("FORMAT POSISISTOK*.xlsx", work_dir)
 
     trn_path = find_file("TRN*.xlsx", [work_dir, "D:\\ANALISA STOK"])
+    if 3 in target_stages and not trn_path:
+        raise MandatoryFileNotFoundError("TRN*.xlsx", work_dir)
+
     soout_path = find_file("SOOUT*.xlsx", [work_dir])
+    if (4 in target_stages or 7 in target_stages) and not soout_path:
+        raise MandatoryFileNotFoundError("SOOUT*.xlsx", work_dir)
+
     poout_path = find_file("POOUT*.xlsx", [work_dir])
+    if 5 in target_stages and not poout_path:
+        raise MandatoryFileNotFoundError("POOUT*.xlsx", work_dir)
+
     stok_path = find_file("STOK*.xlsx", [work_dir, "D:\\ANALISA STOK", "D:\\"])
+    if 2 in target_stages and not stok_path:
+        raise MandatoryFileNotFoundError("STOK*.xlsx", work_dir)
 
     ref_dir = os.path.join(PROJECT_ROOT, "REFERENSI")
     su_path = find_file("SALESUNIT2026.xlsx", [ref_dir, work_dir, PROJECT_ROOT, "D:\\", APP_DIR]) or \
               find_file("SU2026.xlsx", [ref_dir, work_dir, PROJECT_ROOT, "D:\\", APP_DIR])
 
-    buku_masuk_path = find_file("buku masuk*.xlsx", [work_dir])
-    if not buku_masuk_path:
-        candidates = glob.glob(os.path.join(work_dir, "BUKMAS*.xlsx"))
-        candidates = [c for c in candidates if "PRINT" not in os.path.basename(c).upper()]
-        if candidates:
-            candidates.sort(key=lambda x: os.path.getmtime(x), reverse=True)
-            buku_masuk_path = candidates[0]
+    # Kumpulkan seluruh file Buku Masuk (bisa multi-file jika ada pengiriman pagi & siang)
+    bm_files = []
+    for pat in ["buku masuk*.xlsx", "BUKMAS*.xlsx"]:
+        for match in glob.glob(os.path.join(work_dir, pat)):
+            if "PRINT" not in os.path.basename(match).upper() and match not in bm_files:
+                bm_files.append(match)
+    bm_files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+    buku_masuk_path = bm_files[0] if bm_files else None
 
-    do_summary_path = find_file("Do_Summary_External*.csv", [work_dir])
-    date_str = extract_date_str(format_cabang_path)
+    date_str = extract_date_str(format_cabang_path or buku_masuk_path or soout_path or work_dir)
+    do_summary_path = None
+    if 8 in target_stages:
+        do_summary_path = find_do_summary_for_date(work_dir, target_date_str=date_str, report_fn=report_fn)
 
-    report_fn(f"  - Format Cabang : {os.path.basename(format_cabang_path)}")
-    report_fn(f"  - STOK          : {os.path.basename(stok_path) if stok_path else '[TIDAK DITEMUKAN]'}")
-    report_fn(f"  - TRN           : {os.path.basename(trn_path) if trn_path else '[TIDAK DITEMUKAN]'}")
-    report_fn(f"  - SOOUT         : {os.path.basename(soout_path) if soout_path else '[TIDAK DITEMUKAN]'}")
-    report_fn(f"  - POOUT         : {os.path.basename(poout_path) if poout_path else '[TIDAK DITEMUKAN]'}")
+    report_fn(f"  - Format Cabang : {os.path.basename(format_cabang_path) if format_cabang_path else '[TIDAK DIGUNAKAN]'}")
+    report_fn(f"  - STOK          : {os.path.basename(stok_path) if stok_path else '[TIDAK DIGUNAKAN / TIDAK ADA]'}")
+    report_fn(f"  - TRN           : {os.path.basename(trn_path) if trn_path else '[TIDAK DIGUNAKAN / TIDAK ADA]'}")
+    report_fn(f"  - SOOUT         : {os.path.basename(soout_path) if soout_path else '[TIDAK DIGUNAKAN / TIDAK ADA]'}")
+    report_fn(f"  - POOUT         : {os.path.basename(poout_path) if poout_path else '[TIDAK DIGUNAKAN / TIDAK ADA]'}")
     report_fn(f"  - Master Sales  : {os.path.basename(su_path) if su_path else '[TIDAK DITEMUKAN]'}")
-    report_fn(f"  - Buku Masuk    : {os.path.basename(buku_masuk_path) if buku_masuk_path else '[TIDAK ADA - SKIP]'}")
-    report_fn(f"  - DO Summary    : {os.path.basename(do_summary_path) if do_summary_path else '[TIDAK ADA - SKIP]'}")
+    if bm_files:
+        bm_names = ", ".join([os.path.basename(f) for f in bm_files])
+        report_fn(f"  - Buku Masuk    : {bm_names} ({len(bm_files)} file)")
+    else:
+        report_fn(f"  - Buku Masuk    : [TIDAK ADA - SKIP]")
+    if 8 in target_stages:
+        report_fn(f"  - DO Summary    : {os.path.basename(do_summary_path) if do_summary_path else '[BELUM ADA DI FOLDER]'}")
     report_fn(f"  - Tanggal Opr   : {date_str}")
 
     return InputBundle(
@@ -471,6 +536,7 @@ def stage_1_discover_inputs(work_dir: str, report_fn: Callable[[str], None]) -> 
         poout_path=poout_path,
         su_path=su_path,
         buku_masuk_path=buku_masuk_path,
+        buku_masuk_paths=bm_files,
         do_summary_path=do_summary_path
     )
 
@@ -495,17 +561,50 @@ def stage_2_process_stok(stok_path: Optional[str], report_fn: Callable[[str], No
     df_stok['wh_clean'] = df_stok[wh_col].apply(normalize_wh)
     df_stok['item_clean'] = df_stok[it_col].apply(normalize_item)
 
+    # Filter baris yang valid (item dan warehouse tidak kosong)
+    df_stok = df_stok[(df_stok['item_clean'] != "") & (df_stok['wh_clean'] != "")].copy()
+
     df_pst = df_stok[df_stok['wh_clean'] == '50'].groupby('item_clean')[qty_col].sum()
-    stok_pst = df_pst.to_dict()
+    stok_pst = {k: v for k, v in df_pst.to_dict().items() if k}
 
     df_mks = df_stok[df_stok['wh_clean'] == '56'].groupby('item_clean')[qty_col].sum()
-    stok_mks = df_mks.to_dict()
+    stok_mks = {k: v for k, v in df_mks.to_dict().items() if k}
 
     # Rule Baku: Nasional = Semua kecuali 50, 56, 723
     df_nas = df_stok[~df_stok['wh_clean'].isin(['50', '56', '723'])].groupby('item_clean')[qty_col].sum()
-    stok_nas = df_nas.to_dict()
+    stok_nas = {k: v for k, v in df_nas.to_dict().items() if k}
 
+    wh_available = sorted(df_stok['wh_clean'].unique())
+    report_fn(f"Gudang terdeteksi: {', '.join(wh_available)}")
     report_fn(f"Agregasi selesai: {len(stok_pst):,} item Pusat, {len(stok_nas):,} item Nasional, {len(stok_mks):,} item Makassar")
+    if len(stok_nas) == 0:
+        report_fn("  [PERHATIAN] Data STOK Nasional tidak tersedia pada file STOK (hanya Pusat & Makassar).")
+        report_fn("  Kolom STOK_NAS pada Format Cabang akan dipertahankan dari data sebelumnya (tidak di-overwrite 0).")
+
+    # Pembuatan Sheet2 Pivot STOK (standar konsisten sama dengan TRN, SOOUT, POOUT)
+    wb_stok = openpyxl.load_workbook(stok_path)
+    default_wh = "56" if "56" in wh_available else ("(All)" if len(wh_available) > 1 else wh_available[0])
+    fallback_dict = stok_mks if "56" in wh_available else {k: v for k, v in df_stok.groupby('item_clean')[qty_col].sum().to_dict().items() if k}
+    write_pivot_sheet(wb_stok, "Sum of Available physical", fallback_dict, page_header=("Warehouse", default_wh))
+    safe_save_workbook(wb_stok, stok_path)
+
+    try:
+        from native_pivot import create_native_excel_pivot
+        create_native_excel_pivot(
+            xlsx_path=stok_path,
+            table_name="MyGrid",
+            target_sheet="Sheet2",
+            row_field="Item number",
+            val_field="Available physical",
+            page_field="Warehouse",
+            page_item=default_wh,
+            style_name="PivotStyleLight16",
+            log_func=report_fn
+        )
+    except Exception as e:
+        report_fn(f"  [PIVOT NOTE] Menggunakan tabel statis cadangan: {e}")
+
+    report_fn(f"Sheet2 Pivot STOK diperbarui ({len(fallback_dict):,} item unik)")
     return StokBundle(pst=stok_pst, nas=stok_nas, mks=stok_mks)
 
 @dataclass
@@ -562,6 +661,19 @@ def stage_3_process_trn(trn_path: Optional[str], report_fn: Callable[[str], None
 
     write_pivot_sheet(wb_trn, "Sum of Quantity", trn_pivot)
     safe_save_workbook(wb_trn, trn_path)
+    try:
+        from native_pivot import create_native_excel_pivot
+        create_native_excel_pivot(
+            xlsx_path=trn_path,
+            table_name="MyGrid",
+            target_sheet="Sheet2",
+            row_field="Item number",
+            val_field="Quantity",
+            style_name="PivotStyleLight16",
+            log_func=report_fn
+        )
+    except Exception as e:
+        report_fn(f"  [PIVOT NOTE] Menggunakan tabel statis cadangan: {e}")
     report_fn(f"Sheet2 Pivot TRN diperbarui ({len(trn_pivot):,} item unik)")
     return TrnBundle(pivot=trn_pivot)
 
@@ -589,6 +701,19 @@ def stage_4_process_soout(soout_path: Optional[str], report_fn: Callable[[str], 
     wb_so = openpyxl.load_workbook(soout_path)
     write_pivot_sheet(wb_so, "Sum of Deliver Reminder", so_raw)
     safe_save_workbook(wb_so, soout_path)
+    try:
+        from native_pivot import create_native_excel_pivot
+        create_native_excel_pivot(
+            xlsx_path=soout_path,
+            table_name="MyGrid",
+            target_sheet="Sheet2",
+            row_field="Item number",
+            val_field="Deliver reminder",
+            style_name="PivotStyleLight16",
+            log_func=report_fn
+        )
+    except Exception:
+        pass
     report_fn(f"Sheet2 Pivot SOOUT diperbarui ({len(so_raw):,} item unik)")
     return SooutBundle(pivot_positive=soout_positive)
 
@@ -615,6 +740,19 @@ def stage_5_process_poout(poout_path: Optional[str], report_fn: Callable[[str], 
     wb_po = openpyxl.load_workbook(poout_path)
     write_pivot_sheet(wb_po, "Sum of Deliver remainder", poout_pivot)
     safe_save_workbook(wb_po, poout_path)
+    try:
+        from native_pivot import create_native_excel_pivot
+        create_native_excel_pivot(
+            xlsx_path=poout_path,
+            table_name="MyGrid",
+            target_sheet="Sheet2",
+            row_field="Item number",
+            val_field="Deliver remainder",
+            style_name="PivotStyleLight16",
+            log_func=report_fn
+        )
+    except Exception:
+        pass
     report_fn(f"Sheet2 Pivot POOUT diperbarui ({len(poout_pivot):,} item unik)")
     return PooutBundle(pivot=poout_pivot)
 
@@ -629,6 +767,25 @@ def stage_6_fill_format_cabang(
     report_fn(f"Membuka Format Cabang: {os.path.basename(format_cabang_path)}...")
     wb_fc = openpyxl.load_workbook(format_cabang_path)
     ws_fc = wb_fc.active
+
+    # Deteksi posisi kolom target secara dinamis dari header baris 3
+    col_map = {}
+    for c in range(1, ws_fc.max_column + 1):
+        v = str(ws_fc.cell(row=3, column=c).value or "").strip().upper()
+        if "KODBUK" in v: col_map["KODBUK"] = c
+        elif "STOK_PST" in v or "STOK PST" in v: col_map["STOK_PST"] = c
+        elif "STOK_NAS" in v or "STOK NAS" in v: col_map["STOK_NAS"] = c
+        elif "STOK_MKS" in v or "STOK MKS" in v: col_map["STOK_MKS"] = c
+        elif v == "TRANS" or "TRANS" in v: col_map["TRANS"] = c
+        elif "SOOUT" in v or "SO OUT" in v: col_map["SOOUT"] = c
+        elif "PO OUT" in v or "POOUT" in v: col_map["POOUT"] = c
+
+    c_pst = col_map.get("STOK_PST", 33)
+    c_nas = col_map.get("STOK_NAS", 34)
+    c_mks = col_map.get("STOK_MKS", 35)
+    c_trn = col_map.get("TRANS", 36)
+    c_so  = col_map.get("SOOUT", 37)
+    c_po  = col_map.get("POOUT", 38)
 
     consecutive_empty = 0
     actual_last_row = 3
@@ -645,17 +802,61 @@ def stage_6_fill_format_cabang(
     total_books = last_row - 3
     report_fn(f"Mengisi {total_books:,} baris buku di Format Cabang (Baris 4 s/d {last_row})...")
 
+    has_pst = bool(stok.pst)
+    has_nas = bool(stok.nas)
+    has_mks = bool(stok.mks)
+    has_trn = bool(trn.pivot)
+    has_soout = bool(soout.pivot_positive)
+    has_poout = bool(poout.pivot)
+
+    if not has_nas:
+        report_fn(f"  [PERHATIAN] Data STOK Nasional tidak tersedia pada file STOK (hanya Pusat & Makassar). Kolom STOK_NAS ({c_nas}) dipertahankan.")
+    if not has_pst:
+        report_fn(f"  [INFO] Data STOK Pusat tidak tersedia pada file STOK -> Kolom STOK_PST ({c_pst}) dipertahankan.")
+    if not has_mks:
+        report_fn(f"  [INFO] Data STOK Makassar tidak tersedia pada file STOK -> Kolom STOK_MKS ({c_mks}) dipertahankan.")
+    if not has_trn:
+        report_fn(f"  [INFO] Data TRN tidak tersedia -> Kolom TRANS ({c_trn}) dipertahankan.")
+    if not has_soout:
+        report_fn(f"  [INFO] Data SOOUT tidak tersedia -> Kolom SOOUT ({c_so}) dipertahankan.")
+    if not has_poout:
+        report_fn(f"  [INFO] Data POOUT tidak tersedia -> Kolom PO OUT ({c_po}) dipertahankan.")
+
+    seen_items = set()
+    dup_items_found = set()
     for r in range(4, last_row + 1):
         item_val = ws_fc.cell(row=r, column=1).value
         item = normalize_item(item_val)
         if not item:
             continue
-        ws_fc.cell(row=r, column=33, value=stok.pst.get(item, 0))
-        ws_fc.cell(row=r, column=34, value=stok.nas.get(item, 0))
-        ws_fc.cell(row=r, column=35, value=stok.mks.get(item, 0))
-        ws_fc.cell(row=r, column=36, value=trn.pivot.get(item, 0))
-        ws_fc.cell(row=r, column=37, value=soout.pivot_positive.get(item, 0))
-        ws_fc.cell(row=r, column=38, value=poout.pivot.get(item, 0))
+
+        if item in seen_items:
+            dup_items_found.add(item)
+            # Baris duplikat di Format Cabang: isi 0 untuk mencegah double-count stok fisik gudang
+            if has_pst: ws_fc.cell(row=r, column=c_pst, value=0)
+            if has_nas: ws_fc.cell(row=r, column=c_nas, value=0)
+            if has_mks: ws_fc.cell(row=r, column=c_mks, value=0)
+            if has_trn: ws_fc.cell(row=r, column=c_trn, value=0)
+            if has_soout: ws_fc.cell(row=r, column=c_so, value=0)
+            if has_poout: ws_fc.cell(row=r, column=c_po, value=0)
+            continue
+
+        seen_items.add(item)
+        if has_pst:
+            ws_fc.cell(row=r, column=c_pst, value=int(round(stok.pst.get(item, 0))))
+        if has_nas:
+            ws_fc.cell(row=r, column=c_nas, value=int(round(stok.nas.get(item, 0))))
+        if has_mks:
+            ws_fc.cell(row=r, column=c_mks, value=int(round(stok.mks.get(item, 0))))
+        if has_trn:
+            ws_fc.cell(row=r, column=c_trn, value=int(round(trn.pivot.get(item, 0))))
+        if has_soout:
+            ws_fc.cell(row=r, column=c_so, value=int(round(soout.pivot_positive.get(item, 0))))
+        if has_poout:
+            ws_fc.cell(row=r, column=c_po, value=int(round(poout.pivot.get(item, 0))))
+
+    if dup_items_found:
+        report_fn(f"  [PROTEKSI DUPLIKASI] Ditemukan {len(dup_items_found)} item duplikat di Format Cabang: {', '.join(sorted(dup_items_found))}. Baris duplikat diisi 0 agar total stok cabang tidak berlebih.")
 
     safe_save_workbook(wb_fc, format_cabang_path)
     report_fn(f"File Format Cabang berhasil disimpan ({total_books:,} buku terisi)")
@@ -665,12 +866,16 @@ def stage_7_process_buku_masuk_fifo(
     inputs: InputBundle,
     report_fn: Callable[[str], None]
 ) -> Optional[str]:
-    if not inputs.buku_masuk_path or not os.path.exists(inputs.buku_masuk_path):
+    bm_paths = inputs.buku_masuk_paths or ([inputs.buku_masuk_path] if inputs.buku_masuk_path else [])
+    if not bm_paths:
         report_fn("Tidak ada file Buku Masuk hari ini. Tahap alokasi FIFO dilewati.")
         return None
 
     if not inputs.soout_path or not os.path.exists(inputs.soout_path):
-        raise DailyDataError("File SOOUT tidak ditemukan untuk alokasi Buku Masuk.")
+        raise DailyDataError(
+            "File SOOUT tidak ditemukan untuk alokasi Buku Masuk.",
+            "Pastikan file SOOUT hari ini ada di folder sebelum memproses Buku Masuk."
+        )
 
     report_fn("Memproses Alokasi Buku Masuk & Ekstraksi FIFO...")
     su_db = {}
@@ -678,10 +883,19 @@ def stage_7_process_buku_masuk_fifo(
         su_db = build_sales_hierarchy(inputs.su_path)
         report_fn(f"Master Sales dimuat: {len(su_db):,} sales responsible")
 
-    df_bm = pd.read_excel(inputs.buku_masuk_path, dtype=str)
-    bm_it_col = [c for c in df_bm.columns if "item number" in c.lower()][0]
-    bm_items = {normalize_item(x) for x in df_bm[bm_it_col].dropna().unique()}
-    report_fn(f"Buku masuk memuat {len(bm_items):,} item unik.")
+    bm_items = set()
+    for bm_p in bm_paths:
+        report_fn(f"Membaca file Buku Masuk: {os.path.basename(bm_p)}...")
+        df_bm = pd.read_excel(bm_p, dtype=str)
+        bm_it_cols = [c for c in df_bm.columns if "item number" in c.lower()]
+        if bm_it_cols:
+            f_items = {normalize_item(x) for x in df_bm[bm_it_cols[0]].dropna().unique() if normalize_item(x)}
+            report_fn(f"  -> {len(f_items):,} item unik terdeteksi pada {os.path.basename(bm_p)}")
+            bm_items.update(f_items)
+        else:
+            report_fn(f"  [PERINGATAN] Kolom 'Item number' tidak ditemukan di {os.path.basename(bm_p)}")
+
+    report_fn(f"Total akumulasi buku masuk: {len(bm_items):,} item unik dari {len(bm_paths)} file.")
 
     df_so_raw = pd.read_excel(inputs.soout_path, sheet_name="Sheet1", dtype=str)
     so_col = [c for c in df_so_raw.columns if "sales order" in c.lower()][0]
@@ -721,79 +935,265 @@ def stage_7_process_buku_masuk_fifo(
     safe_save_workbook(wb_so, inputs.soout_path)
     report_fn(f"Sheet3 SOOUT FIFO disimpan ({len(df_soe_save):,} baris SOE)")
 
+    # Cek apakah file print sudah pernah dibuat sebelumnya
+    bm_print_candidates = [
+        f for f in glob.glob(os.path.join(inputs.work_dir, "BUKMAS*PRINT*.xlsx"))
+        if "(BARU)" not in os.path.basename(f).upper()
+    ]
+    bm_print_candidates.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+    existing_print_path = bm_print_candidates[0] if bm_print_candidates else None
+    old_items_list = []
+    existing_items = set()
+    existing_sos = set()
+
+    if existing_print_path and os.path.exists(existing_print_path):
+        try:
+            wb_prev = openpyxl.load_workbook(existing_print_path, data_only=True, read_only=True)
+            if "ITEM_MASUK" in wb_prev.sheetnames:
+                ws_it = wb_prev["ITEM_MASUK"]
+                for r_idx, row in enumerate(ws_it.iter_rows(values_only=True), 1):
+                    if r_idx > 1 and row and row[0]:
+                        v_str = str(row[0]).strip()
+                        if "new" in v_str.lower() and "=" in v_str:
+                            continue
+                        clean_it = normalize_item(row[0])
+                        if clean_it:
+                            existing_items.add(clean_it)
+                            if clean_it not in old_items_list:
+                                old_items_list.append(clean_it)
+            for sname in ["MGR1", "MGR2"]:
+                if sname in wb_prev.sheetnames:
+                    ws_prev = wb_prev[sname]
+                    it_idx, so_idx = None, None
+                    for r_idx, r_vals in enumerate(ws_prev.iter_rows(values_only=True), 1):
+                        if r_idx == 1:
+                            for c_i, h in enumerate(r_vals):
+                                h_str = str(h or "").lower()
+                                if "item number" in h_str and it_idx is None:
+                                    it_idx = c_i
+                                if "sales order" in h_str and so_idx is None:
+                                    so_idx = c_i
+                            continue
+                        if not r_vals:
+                            continue
+                        if it_idx is not None and it_idx < len(r_vals) and r_vals[it_idx]:
+                            existing_items.add(normalize_item(r_vals[it_idx]))
+                        if so_idx is not None and so_idx < len(r_vals) and r_vals[so_idx]:
+                            existing_sos.add(str(r_vals[so_idx]).strip())
+            wb_prev.close()
+        except Exception as e:
+            report_fn(f"  [INFO] Catatan pembacaan file print lama: {e}")
+
     df_filtered = df_soe[df_soe['item_clean'].isin(bm_items)].copy()
+    current_sos = set(df_filtered[so_col].astype(str).str.strip().unique()) if not df_filtered.empty else set()
+
+    # Evaluasi data baru
+    new_bm_items = bm_items - existing_items
+    new_sos = current_sos - existing_sos
+
+    # Cek apakah item baru memiliki pesanan SO terbuka
+    new_items_with_so = [it for it in new_bm_items if it in df_soe['item_clean'].values]
+
+    # Jika file print sudah ada dan TIDAK ADA buku masuk baru maupun SO baru, lewati ekspor
+    if existing_print_path and len(existing_items) > 0 and len(new_bm_items) == 0 and len(new_sos) == 0:
+        report_fn(f"  [INFO] Tidak ada buku masuk baru yang belum diekspor.")
+        report_fn(f"  [INFO] Seluruh {len(bm_items):,} item buku masuk ({len(current_sos):,} SO) sudah tercakup dalam {os.path.basename(existing_print_path)}.")
+        report_fn(f"  [INFO] Ekspor dilewati karena semua data sudah mutakhir (aman dari overwrite).")
+        return existing_print_path
+
+    is_incremental = bool(existing_print_path and len(existing_items) > 0 and (len(new_bm_items) > 0 or len(new_sos) > 0))
+    if is_incremental:
+        report_fn(f"  [UPDATE] Terdeteksi kiriman buku masuk baru ({len(new_items_with_so):,} item baru ber-SO, {len(new_sos):,} pesanan SO baru)!")
+        if new_items_with_so:
+            report_fn(f"  [UPDATE] Contoh item baru: {', '.join(sorted(list(new_items_with_so))[:5])}")
+
     df_m1 = df_filtered[df_filtered['MGR'].str.contains("1", na=False)].copy()
     df_m2 = df_filtered[df_filtered['MGR'].str.contains("2", na=False)].copy()
 
     cols_28 = list(df_soe_save.columns[:28])
-    df_m1_print = df_m1[cols_28].copy()
-    df_m2_print = df_m2[cols_28].copy()
+
+    if is_incremental:
+        df_filtered_old = df_filtered[df_filtered['item_clean'].isin(existing_items) & ~df_filtered[so_col].isin(new_sos)].copy()
+        df_filtered_new = df_filtered[df_filtered['item_clean'].isin(new_bm_items) | df_filtered[so_col].isin(new_sos)].copy()
+
+        df_m1_old = df_filtered_old[df_filtered_old['MGR'].str.contains("1", na=False)][cols_28].copy()
+        df_m1_new = df_filtered_new[df_filtered_new['MGR'].str.contains("1", na=False)][cols_28].copy()
+
+        df_m2_old = df_filtered_old[df_filtered_old['MGR'].str.contains("2", na=False)][cols_28].copy()
+        df_m2_new = df_filtered_new[df_filtered_new['MGR'].str.contains("2", na=False)][cols_28].copy()
+
+        so_m1_old_list = [s for s in dict.fromkeys(df_m1_old[so_col])]
+        so_m1_new_list = [s for s in dict.fromkeys(df_m1_new[so_col])]
+
+        so_m2_old_list = [s for s in dict.fromkeys(df_m2_old[so_col])]
+        so_m2_new_list = [s for s in dict.fromkeys(df_m2_new[so_col])]
+    else:
+        df_m1 = df_filtered[df_filtered['MGR'].str.contains("1", na=False)][cols_28].copy()
+        df_m2 = df_filtered[df_filtered['MGR'].str.contains("2", na=False)][cols_28].copy()
+
+        df_m1_old = df_m1
+        df_m1_new = pd.DataFrame(columns=cols_28)
+
+        df_m2_old = df_m2
+        df_m2_new = pd.DataFrame(columns=cols_28)
+
+        so_m1_old_list = [s for s in dict.fromkeys(df_m1[so_col])]
+        so_m1_new_list = []
+
+        so_m2_old_list = [s for s in dict.fromkeys(df_m2[so_col])]
+        so_m2_new_list = []
 
     bukmas_filename = f"BUKMAS {inputs.date_str} PRINT.xlsx"
     bukmas_print_path = os.path.join(inputs.work_dir, bukmas_filename)
     wb_bp = openpyxl.Workbook()
 
+    # Sheet MGR1: Data lama lalu data baru langsung di bawahnya tanpa pemisah
     ws_m1 = wb_bp.active
     ws_m1.title = "MGR1"
-    for r_idx, row in enumerate(dataframe_to_rows(df_m1_print, index=False, header=True), 1):
+    for c_idx, col_name in enumerate(cols_28, 1):
+        ws_m1.cell(row=1, column=c_idx, value=col_name)
+    cur_m1_row = 2
+    for row in dataframe_to_rows(df_m1_old, index=False, header=False):
         for c_idx, val in enumerate(row, 1):
-            ws_m1.cell(row=r_idx, column=c_idx, value=val)
+            ws_m1.cell(row=cur_m1_row, column=c_idx, value=val)
+        cur_m1_row += 1
+    if is_incremental and not df_m1_new.empty:
+        for row in dataframe_to_rows(df_m1_new, index=False, header=False):
+            for c_idx, val in enumerate(row, 1):
+                ws_m1.cell(row=cur_m1_row, column=c_idx, value=val)
+            cur_m1_row += 1
     ws_m1.auto_filter.ref = ws_m1.dimensions
 
+    # Sheet MGR2: Data lama lalu data baru langsung di bawahnya tanpa pemisah
     ws_m2 = wb_bp.create_sheet("MGR2")
-    for r_idx, row in enumerate(dataframe_to_rows(df_m2_print, index=False, header=True), 1):
+    for c_idx, col_name in enumerate(cols_28, 1):
+        ws_m2.cell(row=1, column=c_idx, value=col_name)
+    cur_m2_row = 2
+    for row in dataframe_to_rows(df_m2_old, index=False, header=False):
         for c_idx, val in enumerate(row, 1):
-            ws_m2.cell(row=r_idx, column=c_idx, value=val)
+            ws_m2.cell(row=cur_m2_row, column=c_idx, value=val)
+        cur_m2_row += 1
+    if is_incremental and not df_m2_new.empty:
+        for row in dataframe_to_rows(df_m2_new, index=False, header=False):
+            for c_idx, val in enumerate(row, 1):
+                ws_m2.cell(row=cur_m2_row, column=c_idx, value=val)
+            cur_m2_row += 1
     ws_m2.auto_filter.ref = ws_m2.dimensions
 
+    # Sheet DELIMIT: Penanda simpel =====new===== hanya jika ada data baru
     ws_delimit = wb_bp.create_sheet("DELIMIT")
     ws_delimit.cell(row=1, column=1, value="PANDUAN COPY-PASTE FILTER DYNAMICS AX (PER 14 ITEM)")
     ws_delimit.cell(row=1, column=1).font = openpyxl.styles.Font(bold=True, size=12)
 
     cur_row = 3
-    # M1 Delimit
-    so_m1_list = [s for s in dict.fromkeys(df_m1[so_col])]
-    ws_delimit.cell(row=cur_row, column=1, value=f"[ MANAGER 1 - TOTAL {len(so_m1_list)} SALES ORDER ]").font = openpyxl.styles.Font(bold=True, color="000080")
+    # M1 Delimit (Awal / Lama)
+    ws_delimit.cell(row=cur_row, column=1, value=f"[ MANAGER 1 - TOTAL {len(so_m1_old_list)} SALES ORDER ]").font = openpyxl.styles.Font(bold=True, color="000080")
     cur_row += 1
     batch_num = 1
-    for i in range(0, len(so_m1_list), 14):
-        chunk = so_m1_list[i:i+14]
+    for i in range(0, len(so_m1_old_list), 14):
+        chunk = so_m1_old_list[i:i+14]
         ws_delimit.cell(row=cur_row, column=1, value=f"Batch M1-{batch_num} ({len(chunk)} item):")
         ws_delimit.cell(row=cur_row, column=2, value=",".join(chunk))
         cur_row += 1
         batch_num += 1
 
     cur_row += 1
-    # M2 Delimit
-    so_m2_list = [s for s in dict.fromkeys(df_m2[so_col])]
-    ws_delimit.cell(row=cur_row, column=1, value=f"[ MANAGER 2 - TOTAL {len(so_m2_list)} SALES ORDER ]").font = openpyxl.styles.Font(bold=True, color="000080")
+    # M2 Delimit (Awal / Lama)
+    ws_delimit.cell(row=cur_row, column=1, value=f"[ MANAGER 2 - TOTAL {len(so_m2_old_list)} SALES ORDER ]").font = openpyxl.styles.Font(bold=True, color="000080")
     cur_row += 1
     batch_num = 1
-    for i in range(0, len(so_m2_list), 14):
-        chunk = so_m2_list[i:i+14]
+    for i in range(0, len(so_m2_old_list), 14):
+        chunk = so_m2_old_list[i:i+14]
         ws_delimit.cell(row=cur_row, column=1, value=f"Batch M2-{batch_num} ({len(chunk)} item):")
         ws_delimit.cell(row=cur_row, column=2, value=",".join(chunk))
         cur_row += 1
         batch_num += 1
 
-    for ws in [ws_m1, ws_m2, ws_delimit]:
+    # Jika incremental dan ada SO baru, beri penanda simpel =====new=====
+    if is_incremental and (so_m1_new_list or so_m2_new_list):
+        cur_row += 1
+        ws_delimit.cell(row=cur_row, column=1, value="=====new=====").font = openpyxl.styles.Font(bold=True, color="B91C1C", size=11)
+        cur_row += 2
+
+        if so_m1_new_list:
+            ws_delimit.cell(row=cur_row, column=1, value=f"[ MANAGER 1 - TOTAL {len(so_m1_new_list)} SALES ORDER ]").font = openpyxl.styles.Font(bold=True, color="000080")
+            cur_row += 1
+            for i in range(0, len(so_m1_new_list), 14):
+                chunk = so_m1_new_list[i:i+14]
+                ws_delimit.cell(row=cur_row, column=1, value=f"Batch M1-{(i//14)+1} ({len(chunk)} item):")
+                ws_delimit.cell(row=cur_row, column=2, value=",".join(chunk))
+                cur_row += 1
+
+        if so_m2_new_list:
+            if so_m1_new_list:
+                cur_row += 1
+            ws_delimit.cell(row=cur_row, column=1, value=f"[ MANAGER 2 - TOTAL {len(so_m2_new_list)} SALES ORDER ]").font = openpyxl.styles.Font(bold=True, color="000080")
+            cur_row += 1
+            for i in range(0, len(so_m2_new_list), 14):
+                chunk = so_m2_new_list[i:i+14]
+                ws_delimit.cell(row=cur_row, column=1, value=f"Batch M2-{(i//14)+1} ({len(chunk)} item):")
+                ws_delimit.cell(row=cur_row, column=2, value=",".join(chunk))
+                cur_row += 1
+
+    # Sheet ITEM_MASUK: Penanda simpel =====new===== hanya jika ada data baru
+    ws_it_save = wb_bp.create_sheet("ITEM_MASUK")
+    ws_it_save.cell(row=1, column=1, value="Item number")
+    cur_it_row = 2
+
+    if is_incremental:
+        items_to_write_old = old_items_list if old_items_list else [it for it in sorted(existing_items)]
+        if not items_to_write_old:
+            items_to_write_old = [it for it in sorted(bm_items - set(new_bm_items))]
+        for it_code in items_to_write_old:
+            ws_it_save.cell(row=cur_it_row, column=1, value=it_code)
+            cur_it_row += 1
+
+        if new_bm_items:
+            ws_it_save.cell(row=cur_it_row, column=1, value="=====new=====").font = openpyxl.styles.Font(bold=True, color="B91C1C")
+            cur_it_row += 1
+            for it_code in sorted(new_bm_items):
+                ws_it_save.cell(row=cur_it_row, column=1, value=it_code)
+                cur_it_row += 1
+    else:
+        for it_code in sorted(bm_items):
+            ws_it_save.cell(row=cur_it_row, column=1, value=it_code)
+            cur_it_row += 1
+
+    for ws in wb_bp.worksheets:
         for col in ws.columns:
             max_len = max(len(str(cell.value or '')) for cell in col[:40])
             col_letter = get_column_letter(col[0].column)
             ws.column_dimensions[col_letter].width = min(max(max_len + 3, 11), 45)
 
     safe_save_workbook(wb_bp, bukmas_print_path)
-    report_fn(f"File Print selesai dibuat: {bukmas_filename} (M1: {len(df_m1)} baris, M2: {len(df_m2)} baris)")
+    if is_incremental:
+        report_fn(f"  [SUKSES] Master print diperbarui: {bukmas_filename} (+{len(df_m1_new)} M1, +{len(df_m2_new)} M2 baru, penanda '=====new=====')")
+    else:
+        report_fn(f"  [SUKSES] File Print selesai dibuat: {bukmas_filename} (M1: {len(df_m1_old)} baris, M2: {len(df_m2_old)} baris)")
+
     return bukmas_print_path
 
-def stage_8_process_do_summary(do_summary_path: Optional[str], report_fn: Callable[[str], None]) -> Optional[str]:
+def stage_8_process_do_summary(
+    do_summary_path: Optional[str],
+    work_dir: str,
+    report_fn: Callable[[str], None],
+    date_str: Optional[str] = None
+) -> Optional[str]:
     if not do_summary_path or not os.path.exists(do_summary_path):
-        report_fn("Tidak ada file DO Summary External. Tahap ini dilewati.")
+        do_summary_path = find_do_summary_for_date(work_dir, target_date_str=date_str, report_fn=report_fn)
+    if not do_summary_path or not os.path.exists(do_summary_path):
+        report_fn(f"[SKIP] File DO Summary untuk tanggal {date_str or ''} belum ditemukan di folder kerja maupun Downloads.")
         return None
+    out_xlsx = os.path.join(work_dir, os.path.basename(do_summary_path) + ".xlsx")
     report_fn(f"Memproses DO Summary: {os.path.basename(do_summary_path)}...")
-    return process_do_summary_file(do_summary_path, log_func=report_fn)
+    return process_do_summary_file(do_summary_path, out_xlsx_path=out_xlsx, log_func=report_fn)
 
-def stage_9_sync_examples(files_to_sync: List[Optional[str]], report_fn: Callable[[str], None]):
+def stage_9_process_recheck_sp(work_dir: str, report_fn: Callable[[str], None]) -> Optional[str]:
+    report_fn("Memeriksa kesesuaian SP kemarin & mendeteksi potensi selisih stok...")
+    res = run_recheck_sp(work_dir, progress_fn=report_fn)
+    return res.excel_output_path
+
+def stage_10_sync_examples(files_to_sync: List[Optional[str]], report_fn: Callable[[str], None]):
     os.makedirs(EXAMPLES_DIR, exist_ok=True)
     report_fn(f"Menyinkronkan output ke folder: {os.path.relpath(EXAMPLES_DIR, PROJECT_ROOT)}")
     for src in files_to_sync:
@@ -816,8 +1216,17 @@ class DailyDataPipeline:
     Mengelola urutan timeline, isolasi tahapan, pelaporan real-time,
     dan diagnosis kegagalan berstandar industri.
     """
-    def __init__(self, work_dir: Optional[str] = None, progress_callback: Optional[Callable[[str], None]] = None, stage_callback: Optional[Callable[[StageMetric], None]] = None):
+    def __init__(
+        self,
+        work_dir: Optional[str] = None,
+        mode: str = PipelineMode.ALL,
+        selected_stages: Optional[List[int]] = None,
+        progress_callback: Optional[Callable[[str], None]] = None,
+        stage_callback: Optional[Callable[[StageMetric], None]] = None
+    ):
         self.work_dir_input = work_dir
+        self.mode = mode
+        self.selected_stages = selected_stages
         self.progress_callback = progress_callback
         self.stage_callback = stage_callback
         self.timeline = ExecutionTimeline()
@@ -832,7 +1241,7 @@ class DailyDataPipeline:
         self.idx_fc = self.timeline.register_stage("STAGE_06_FORMAT_CABANG", "Pengisian Nilai Format Cabang")
         self.idx_bm = self.timeline.register_stage("STAGE_07_BUKU_MASUK_FIFO", "Alokasi Buku Masuk & Ekstraksi FIFO")
         self.idx_do = self.timeline.register_stage("STAGE_08_DO_SUMMARY", "Pivot Tabular DO Summary External")
-        self.idx_sync = self.timeline.register_stage("STAGE_09_SYNC", "Sinkronisasi Arsip & Output")
+        self.idx_recheck = self.timeline.register_stage("STAGE_09_RECHECK_SP", "Recheck SP Kemarin & Validasi Posting")
 
     def report(self, message: str, level: str = "INFO"):
         prefix = f"[{level}] " if level != "INFO" else ""
@@ -843,9 +1252,10 @@ class DailyDataPipeline:
 
     def _execute_stage(self, stage_idx: int, func: Callable, *args, **kwargs) -> Any:
         stage = self.timeline.get_stage(stage_idx)
+        total_stages = len(self.timeline.stages)
         self.timeline.start_stage(stage_idx)
         self.report(f"\n==================================================", "STAGE")
-        self.report(f"TAHAP [{stage.index}/9]: {stage.name.upper()}", "STAGE")
+        self.report(f"TAHAP [{stage.index}/{total_stages}]: {stage.name.upper()}", "STAGE")
         self.report(f"==================================================", "STAGE")
         if self.stage_callback:
             self.stage_callback(stage)
@@ -867,7 +1277,7 @@ class DailyDataPipeline:
                 summary = f"{len(result.pivot):,} item PO"
 
             self.timeline.complete_stage(stage_idx, summary)
-            self.report(f"[OK] Tahap [{stage.index}/9] Selesai ({stage.duration_sec:.2f}s)", "SUCCESS")
+            self.report(f"[OK] Tahap [{stage.index}/{total_stages}] Selesai ({stage.duration_sec:.2f}s)", "SUCCESS")
             if self.stage_callback:
                 self.stage_callback(stage)
             return result
@@ -899,11 +1309,26 @@ class DailyDataPipeline:
 
     def run(self) -> ExecutionTimeline:
         pipeline_start = time.perf_counter()
+
+        # 1. Tentukan target stages
+        if self.selected_stages:
+            target_stages = set(self.selected_stages)
+            if 1 not in target_stages:
+                target_stages.add(1)
+        elif self.mode in MODE_DEFAULT_STAGES:
+            target_stages = set(MODE_DEFAULT_STAGES[self.mode])
+        else:
+            target_stages = set(MODE_DEFAULT_STAGES[PipelineMode.ALL])
+
+        mode_name = MODE_DESCRIPTIONS.get(self.mode, str(self.mode))
         self.report("================================================================================")
         self.report("                     MEMULAI PIPELINE HARIAN: DAILY DATA                        ")
         self.report("================================================================================")
+        self.report(f"Mode Operasi    : {mode_name}")
+        target_str = ", ".join([f"Tahap {s}" for s in sorted(target_stages)])
+        self.report(f"Tahapan Aktif   : {target_str}")
 
-        # 1. Resolusi Folder Kerja
+        # 2. Resolusi Folder Kerja
         if self.work_dir_input:
             work_dir = resolve_work_dir(self.work_dir_input)
         else:
@@ -915,57 +1340,86 @@ class DailyDataPipeline:
 
         self.report(f"Direktori Target: {work_dir}")
 
-        # Tahap 1: Deteksi File Input
-        inputs: InputBundle = self._execute_stage(self.idx_init, stage_1_discover_inputs, work_dir, self.report)
+        # Tahap 1: Deteksi File Input (Selalu jalan untuk discovery)
+        inputs: InputBundle = self._execute_stage(self.idx_init, stage_1_discover_inputs, work_dir, self.report, sorted(target_stages))
 
         # Tahap 2: Pivot STOK
-        stok_res: StokBundle = self._execute_stage(self.idx_stok, stage_2_process_stok, inputs.stok_path, self.report)
+        if 2 in target_stages:
+            stok_res: StokBundle = self._execute_stage(self.idx_stok, stage_2_process_stok, inputs.stok_path, self.report)
+        else:
+            self.timeline.skip_stage(self.idx_stok, "Dilewati (Tidak dipilih)")
+            stok_res = StokBundle(pst={}, nas={}, mks={})
 
         # Tahap 3: Pivot TRN
-        trn_res: TrnBundle = self._execute_stage(self.idx_trn, stage_3_process_trn, inputs.trn_path, self.report)
+        if 3 in target_stages:
+            trn_res: TrnBundle = self._execute_stage(self.idx_trn, stage_3_process_trn, inputs.trn_path, self.report)
+        else:
+            self.timeline.skip_stage(self.idx_trn, "Dilewati (Tidak dipilih)")
+            trn_res = TrnBundle(pivot={})
 
         # Tahap 4: Pivot SOOUT
-        soout_res: SooutBundle = self._execute_stage(self.idx_so, stage_4_process_soout, inputs.soout_path, self.report)
+        if 4 in target_stages:
+            soout_res: SooutBundle = self._execute_stage(self.idx_so, stage_4_process_soout, inputs.soout_path, self.report)
+        else:
+            self.timeline.skip_stage(self.idx_so, "Dilewati (Tidak dipilih)")
+            soout_res = SooutBundle(pivot_positive={})
 
         # Tahap 5: Pivot POOUT
-        poout_res: PooutBundle = self._execute_stage(self.idx_po, stage_4_process_poout if False else stage_5_process_poout, inputs.poout_path, self.report)
+        if 5 in target_stages:
+            poout_res: PooutBundle = self._execute_stage(self.idx_po, stage_5_process_poout, inputs.poout_path, self.report)
+        else:
+            self.timeline.skip_stage(self.idx_po, "Dilewati (Tidak dipilih)")
+            poout_res = PooutBundle(pivot={})
 
         # Tahap 6: Format Cabang
-        total_books = self._execute_stage(
-            self.idx_fc,
-            stage_6_fill_format_cabang,
-            inputs.format_cabang_path,
-            stok_res,
-            trn_res,
-            soout_res,
-            poout_res,
-            self.report
-        )
+        if 6 in target_stages:
+            if not inputs.format_cabang_path:
+                raise MandatoryFileNotFoundError("FORMAT POSISISTOK*.xlsx", work_dir)
+            total_books = self._execute_stage(
+                self.idx_fc,
+                stage_6_fill_format_cabang,
+                inputs.format_cabang_path,
+                stok_res,
+                trn_res,
+                soout_res,
+                poout_res,
+                self.report
+            )
+        else:
+            self.timeline.skip_stage(self.idx_fc, "Dilewati (Format Cabang tidak diubah)")
 
         # Tahap 7: Buku Masuk & FIFO (Kondisional)
-        if inputs.buku_masuk_path and os.path.exists(inputs.buku_masuk_path):
-            bukmas_out = self._execute_stage(self.idx_bm, stage_7_process_buku_masuk_fifo, inputs, self.report)
+        bukmas_out = None
+        if 7 in target_stages:
+            if inputs.buku_masuk_paths:
+                bukmas_out = self._execute_stage(self.idx_bm, stage_7_process_buku_masuk_fifo, inputs, self.report)
+            else:
+                self.timeline.skip_stage(self.idx_bm, "Tidak ada file Buku Masuk hari ini")
+                self.report(f"\nTahap [7/9] Alokasi Buku Masuk: Dilewati (Tidak ada penerimaan buku hari ini).", "INFO")
         else:
-            self.timeline.skip_stage(self.idx_bm, "Tidak ada file Buku Masuk hari ini")
-            bukmas_out = None
-            self.report("\nTahap [7/9] Alokasi Buku Masuk: Dilewati (Tidak ada penerimaan buku hari ini).", "INFO")
+            self.timeline.skip_stage(self.idx_bm, "Dilewati (Tidak dipilih)")
 
         # Tahap 8: DO Summary External (Kondisional)
-        if inputs.do_summary_path and os.path.exists(inputs.do_summary_path):
-            do_out = self._execute_stage(self.idx_do, stage_8_process_do_summary, inputs.do_summary_path, self.report)
+        do_out = None
+        if 8 in target_stages:
+            curr_do = inputs.do_summary_path
+            if not curr_do or not os.path.exists(curr_do):
+                curr_do = find_do_summary_for_date(inputs.work_dir, target_date_str=inputs.date_str, report_fn=self.report)
+                inputs.do_summary_path = curr_do
+            if curr_do and os.path.exists(curr_do):
+                do_out = self._execute_stage(self.idx_do, stage_8_process_do_summary, curr_do, inputs.work_dir, self.report, inputs.date_str)
+            else:
+                self.timeline.skip_stage(self.idx_do, "Tidak ada file DO Summary sore ini")
+                self.report(f"\nTahap [8/9] DO Summary: Dilewati (File DO Summary untuk tanggal {inputs.date_str} belum diunduh / tidak ditemukan).", "INFO")
         else:
-            self.timeline.skip_stage(self.idx_do, "Tidak ada file DO Summary sore ini")
-            do_out = None
-            self.report("\nTahap [8/9] DO Summary: Dilewati (File belum diunduh).", "INFO")
+            self.timeline.skip_stage(self.idx_do, "Dilewati (Tidak dipilih)")
 
-        # Tahap 9: Sinkronisasi Contoh
-        sync_files = [inputs.format_cabang_path, inputs.soout_path, inputs.poout_path, inputs.trn_path]
-        if bukmas_out:
-            sync_files.append(bukmas_out)
-        if do_out:
-            sync_files.append(do_out)
-
-        self._execute_stage(self.idx_sync, stage_9_sync_examples, sync_files, self.report)
+        # Tahap 9: Recheck SP Kemarin & Validasi Posting
+        recheck_out = None
+        if 9 in target_stages:
+            recheck_out = self._execute_stage(self.idx_recheck, stage_9_process_recheck_sp, inputs.work_dir, self.report)
+        else:
+            self.timeline.skip_stage(self.idx_recheck, "Dilewati (Tidak dipilih)")
 
         # Timeline Summary
         summary_text = self.timeline.get_summary_text()
@@ -974,19 +1428,65 @@ class DailyDataPipeline:
 
 def run_automation(
     work_dir: Optional[str] = None,
+    mode: str = PipelineMode.ALL,
+    selected_stages: Optional[List[int]] = None,
     progress_callback: Optional[Callable[[str], None]] = None,
     stage_callback: Optional[Callable[[StageMetric], None]] = None
 ) -> ExecutionTimeline:
     pipeline = DailyDataPipeline(
         work_dir=work_dir,
+        mode=mode,
+        selected_stages=selected_stages,
         progress_callback=progress_callback,
         stage_callback=stage_callback
     )
     return pipeline.run()
 
 if __name__ == "__main__":
-    target_dir = sys.argv[1] if len(sys.argv) > 1 else None
+    import argparse
+    parser = argparse.ArgumentParser(description="Daily Data Automation Pipeline")
+    parser.add_argument("folder", nargs="?", default=None, help="Folder target harian (misal: 07 OKT 2026)")
+    parser.add_argument("--mode", choices=["all", "stok", "recheck", "bukmas", "dosum", "custom"], default="all",
+                        help="Mode alur kerja: all (1-10), stok (1-6, 9-10), recheck (1, 9), bukmas (7), dosum (8)")
+    parser.add_argument("--stages", help="Daftar nomor tahap dipisah koma (misal: 1,9,10)")
+    parser.add_argument("--inspect", help="Pemeriksaan instan item buku & antrean SO FIFO (Kode atau Judul)")
+    parser.add_argument("--recheck", action="store_true", help="Jalankan recheck SP kemarin & validasi posting instan")
+    args = parser.parse_args()
+
+    if args.recheck:
+        w_dir = resolve_work_dir(args.folder) if args.folder else os.getcwd()
+        if not glob.glob(os.path.join(w_dir, "FORMAT POSISISTOK*.xlsx")):
+            dated_dirs = list_date_folders(PROJECT_ROOT)
+            if dated_dirs:
+                w_dir = dated_dirs[0]
+        run_recheck_sp(w_dir)
+        sys.exit(0)
+
+    if args.inspect:
+        from item_inspector import inspect_item
+        w_dir = resolve_work_dir(args.folder) if args.folder else os.getcwd()
+        if not glob.glob(os.path.join(w_dir, "FORMAT POSISISTOK*.xlsx")):
+            dated_dirs = list_date_folders(PROJECT_ROOT)
+            if dated_dirs:
+                w_dir = dated_dirs[0]
+        res = inspect_item(args.inspect, w_dir)
+        if res:
+            print(res.formatted_report)
+        else:
+            print(f"[INFO] Item '{args.inspect}' tidak ditemukan di folder: {w_dir}")
+        sys.exit(0)
+
+    mode_map = {
+        "all": PipelineMode.ALL,
+        "stok": PipelineMode.POSISI_STOK,
+        "recheck": PipelineMode.RECHECK_SP,
+        "bukmas": PipelineMode.BUKU_MASUK,
+        "dosum": PipelineMode.DO_SUMMARY,
+        "custom": PipelineMode.CUSTOM
+    }
+    sel_stages = [int(s.strip()) for s in args.stages.split(",") if s.strip().isdigit()] if args.stages else None
+
     try:
-        run_automation(work_dir=target_dir)
+        run_automation(work_dir=args.folder, mode=mode_map.get(args.mode, PipelineMode.ALL), selected_stages=sel_stages)
     except Exception as exc:
         sys.exit(1)

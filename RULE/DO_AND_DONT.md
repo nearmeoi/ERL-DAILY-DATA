@@ -164,3 +164,16 @@ Dokumen ini berisi kumpulan aturan baku, logika operasional, serta hal-hal yang 
   * Asisten AI **DILARANG KERAS** melakukan `git commit` maupun `git push` secara inisiatif sendiri tanpa adanya perintah eksplisit dari pengguna.
   * Setiap perubahan kode lokal harus dikonfirmasi terlebih dahulu. Commit ke repository Git hanya boleh dieksekusi jika pengguna secara tegas memerintahkan: *"commit ke git"*, *"push ke repo"*, atau instruksi serupa.
 
+---
+
+## 10. RUTINITAS BUILD EXE & PENGIRIMAN KE DESKTOP (AUTO-SEND TO DESKTOP)
+
+### **DO (Harus & Wajib Dilakukan):**
+* Setiap kali melakukan proses pembungkusan executable (`Daily Data.exe`):
+  1. Hentikan (*stop/terminate*) proses `Daily Data.exe` yang sedang berjalan agar file tidak terkunci (*file lock* / `PermissionError: Access is denied`).
+  2. Bungkus ulang binary standalone menggunakan PyInstaller (`--onefile --windowed --name "Daily Data"`).
+  3. **OTOMATIS BERSIHKAN & SEND TO DESKTOP**: Pertama-tama hapus semua file `Daily Data*.exe` lama di folder Desktop pengguna agar tidak menumpuk atau membingungkan, lalu salin SATU file `Daily Data.exe` tunggal hasil kompilasi terbaru langsung ke Desktop pengguna (overwrite murni tanpa membuat file duplikat seperti '(Updated)').
+  4. Bersihkan direktori build sementara (`build/` dan `dist/`).
+* Dengan rutinitas ini, file executable di Desktop dipastikan **selalu merupakan versi paling mutakhir dan hanya ada 1 file tunggal yang rapi**.
+
+
