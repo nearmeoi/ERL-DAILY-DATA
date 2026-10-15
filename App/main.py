@@ -382,6 +382,20 @@ def repair_external_links(xlsx_path: str) -> bool:
                 pass
         return False
 
+def check_file_locked(file_path: Optional[str]) -> bool:
+    """
+    Mengecek secara non-destruktif apakah sebuah file sedang dibuka/dikunci
+    oleh program lain seperti Microsoft Excel.
+    """
+    if not file_path or not os.path.exists(file_path):
+        return False
+    try:
+        with open(file_path, "r+b"):
+            pass
+        return False
+    except (PermissionError, IOError):
+        return True
+
 def safe_save_workbook(wb: openpyxl.Workbook, path: str):
     """
     Menyimpan file openpyxl dengan penanganan ramah jika file sedang terkunci di Excel.
@@ -525,6 +539,21 @@ def stage_1_discover_inputs(
     if 8 in target_stages:
         report_fn(f"  - DO Summary    : {os.path.basename(do_summary_path) if do_summary_path else '[BELUM ADA DI FOLDER]'}")
     report_fn(f"  - Tanggal Opr   : {date_str}")
+
+    locked_warns = []
+    if 6 in target_stages and format_cabang_path and check_file_locked(format_cabang_path):
+        locked_warns.append(os.path.basename(format_cabang_path))
+    if 3 in target_stages and trn_path and check_file_locked(trn_path):
+        locked_warns.append(os.path.basename(trn_path))
+    if 4 in target_stages and soout_path and check_file_locked(soout_path):
+        locked_warns.append(os.path.basename(soout_path))
+    if 5 in target_stages and poout_path and check_file_locked(poout_path):
+        locked_warns.append(os.path.basename(poout_path))
+    if 2 in target_stages and stok_path and check_file_locked(stok_path):
+        locked_warns.append(os.path.basename(stok_path))
+
+    if locked_warns:
+        report_fn(f"  [PERINGATAN KUNCI FILE] File berikut sedang dibuka di Excel: {', '.join(locked_warns)}")
 
     return InputBundle(
         work_dir=work_dir,

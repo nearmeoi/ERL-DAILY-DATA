@@ -14,6 +14,8 @@ from main import (
     run_automation,
     list_date_folders,
     resolve_work_dir,
+    find_file,
+    check_file_locked,
     PROJECT_ROOT,
     PipelineMode,
     MODE_DESCRIPTIONS,
@@ -170,6 +172,13 @@ class DailyDataGUI:
         self._build_ui()
         self._check_queues()
 
+        # Keyboard shortcuts
+        self.root.bind("<Control-f>", lambda e: self._open_item_inspector())
+        self.root.bind("<Control-F>", lambda e: self._open_item_inspector())
+        self.root.bind("<F5>", lambda e: self._start_pipeline())
+        self.root.bind("<Control-r>", lambda e: self._start_pipeline())
+        self.root.bind("<Control-R>", lambda e: self._start_pipeline())
+
     def _build_ui(self):
         # 1. HEADER (Desain Minimalis Elegan ala Google/Apple)
         header_frame = tk.Frame(self.root, bg="#0f172a", padx=20, pady=14)
@@ -186,7 +195,7 @@ class DailyDataGUI:
 
         subtitle_lbl = tk.Label(
             header_frame,
-            text="Enterprise Pipeline • Stok, FIFO, Buku Masuk, Format Cabang & DO Summary",
+            text="Enterprise Pipeline v2.1 • Stok, FIFO, Format Cabang & DO Summary • [F5: Run] [Ctrl+F: Cari Item]",
             font=("Helvetica", 9),
             fg="#94a3b8",
             bg="#0f172a"
@@ -250,6 +259,7 @@ class DailyDataGUI:
         # Container Checkbox Custom (tampil hanya saat mode Kustom aktif)
         self.custom_stages_frame = tk.Frame(workflow_frame)
         self.stage_check_vars = {}
+
         for idx, short_name in self.stage_defs:
             v = tk.BooleanVar(value=True)
             chk = ttk.Checkbutton(
@@ -268,7 +278,7 @@ class DailyDataGUI:
         # Tombol RUN bergaya modern minimalis
         self.run_btn = tk.Button(
             action_frame,
-            text=" RUN",
+            text=" RUN (F5)",
             image=self.icons.get_play_icon(),
             compound=tk.LEFT,
             font=("Helvetica", 11, "bold"),
@@ -306,7 +316,7 @@ class DailyDataGUI:
         # Tombol Cek Item & Antrean SO FIFO
         self.inspect_btn = tk.Button(
             action_frame,
-            text=" Cek Item & Antrean",
+            text=" Cek Item & Antrean (Ctrl+F)",
             image=self.icons.get_search_icon(),
             compound=tk.LEFT,
             font=("Helvetica", 10, "bold"),
@@ -544,6 +554,30 @@ class DailyDataGUI:
             messagebox.showwarning("Peringatan", "Pilih minimal satu tahapan untuk dijalankan.")
             return
 
+        # Pre-Flight File Lock Check (Cegah eksekusi jika file penting sedang dibuka di Excel)
+        locked_files = []
+        checks = [
+            (6, "FORMAT POSISISTOK*.xlsx"),
+            (3, "TRN*.xlsx"),
+            (4, "SOOUT*.xlsx"),
+            (5, "POOUT*.xlsx"),
+            (2, "STOK*.xlsx")
+        ]
+        for stg_id, pat in checks:
+            if stg_id in active_stages:
+                f_path = find_file(pat, [target_dir])
+                if f_path and check_file_locked(f_path):
+                    locked_files.append(os.path.basename(f_path))
+
+        if locked_files:
+            file_list_str = "\n• " + "\n• ".join(locked_files)
+            messagebox.showwarning(
+                "File Terbuka di Excel",
+                f"File berikut sedang dibuka atau dikunci oleh Microsoft Excel:\n{file_list_str}\n\n"
+                "Harap SIMPAN dan TUTUP file tersebut di Microsoft Excel terlebih dahulu, lalu klik RUN kembali."
+            )
+            return
+
         self.is_running = True
         self.run_btn.configure(state=tk.DISABLED, bg="#94a3b8")
         self.bukmas_btn.configure(state=tk.DISABLED, bg="#94a3b8")
@@ -574,6 +608,21 @@ class DailyDataGUI:
             messagebox.showerror("Error", str(e))
             return
 
+        # Pre-Flight Lock Check untuk Buku Masuk
+        locked_files = []
+        for pat in ["SOOUT*.xlsx", "BUKMAS*PRINT*.xlsx"]:
+            f_path = find_file(pat, [target_dir])
+            if f_path and check_file_locked(f_path):
+                locked_files.append(os.path.basename(f_path))
+        if locked_files:
+            file_list_str = "\n• " + "\n• ".join(locked_files)
+            messagebox.showwarning(
+                "File Terbuka di Excel",
+                f"File berikut sedang dibuka di Microsoft Excel:\n{file_list_str}\n\n"
+                "Harap SIMPAN dan TUTUP file tersebut di Microsoft Excel terlebih dahulu."
+            )
+            return
+
         self.is_running = True
         self.run_btn.configure(state=tk.DISABLED, bg="#94a3b8")
         self.bukmas_btn.configure(state=tk.DISABLED, bg="#94a3b8")
@@ -588,8 +637,8 @@ class DailyDataGUI:
 
     def _quick_process_do_summary(self):
         """
-        Eksekusi 1-klik untuk DO Summary External (Tahap 1, 8 & 10).
-        Secara otomatis mendeteksi file DO Summary hari ini di Downloads / Folder Kerja.
+        Eksekusi 1-klik untuk DO Summary External (Tahap 1 & 8).
+        Secara otomatis mendeteksi file DO Summary hari ini di Folder Kerja.
         """
         if self.is_running:
             return
@@ -603,6 +652,16 @@ class DailyDataGUI:
             target_dir = resolve_work_dir(target_str)
         except Exception as e:
             messagebox.showerror("Error", str(e))
+            return
+
+        # Pre-Flight Lock Check untuk DO Summary
+        f_path = find_file("DO_Summary*.xlsx", [target_dir])
+        if f_path and check_file_locked(f_path):
+            messagebox.showwarning(
+                "File Terbuka di Excel",
+                f"File '{os.path.basename(f_path)}' sedang dibuka di Microsoft Excel.\n\n"
+                "Harap TUTUP file tersebut di Microsoft Excel terlebih dahulu."
+            )
             return
 
         self.is_running = True
